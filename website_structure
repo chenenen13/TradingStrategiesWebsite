@@ -1,0 +1,23 @@
+trading-webapp/
+│
+├── app.py
+├── requirements.txt
+├── render.yaml
+│
+├── trading/
+│   ├── __init__.py
+│   ├── data_loader.py
+│   ├── strategies.py
+│   ├── backtesting.py
+│   ├── outliers.py
+│   ├── metrics.py
+│   └── models.py
+│
+└── pages/
+    ├── __init__.py
+    ├── strategies.py
+    ├── outliers.py
+    ├── news.py
+    ├── dividends.py
+    ├── earnings.py
+    └── resources.py

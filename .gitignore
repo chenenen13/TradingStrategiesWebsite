@@ -1,0 +1,18 @@
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+# OS
+.DS_Store
+
+# notebooks / misc (if any)
+.ipynb_checkpoints/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
