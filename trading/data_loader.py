@@ -1,43 +1,11 @@
 # trading/data_loader.py
-from __future__ import annotations
-
 from typing import List, Optional
-import os
 import pandas as pd
 import yfinance as yf
-
-# robustesse réseau
-import requests
-import requests_cache
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .models import PriceSeries
 
 
-# ----------------------------- Helpers -----------------------------
-def _make_cached_session() -> requests.Session:
-    """
-    Crée une session HTTP avec cache sur /tmp (autorisé sur Render).
-    Cela réduit les rate-limits Yahoo et accélère les cold starts.
-    """
-    cache_dir = "/tmp/yf_cache"
-    os.makedirs(cache_dir, exist_ok=True)
-    return requests_cache.CachedSession(
-        cache_name=os.path.join(cache_dir, "http_cache"),
-        backend="sqlite",
-        expire_after=3600,  # 1h de cache
-    )
-
-
-def _tz_naive_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Rend l'index tz-naive pour éviter les merges vides."""
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        # tz_convert(None) si tz aware; sinon tz_localize(None) plante.
-        df.index = df.index.tz_convert(None)
-    return df
-
-
-# ======================== Data Providers ===========================
 class MarketDataProvider:
     """Abstract base class for market data providers."""
     def get_price_series(self, ticker: str, start: str, end: str) -> PriceSeries:
@@ -48,65 +16,11 @@ class MarketDataProvider:
 
 
 class YahooDataProvider(MarketDataProvider):
-    """
-    Provider Yahoo Finance robuste pour PaaS (Render):
-      - session HTTP mise en cache (/tmp)
-      - retries exponentiels
-      - downloads avec threads=False
-      - nettoyage tz-naive
-    """
-    def __init__(self) -> None:
-        self.session = _make_cached_session()
-
-    # --------------- low-level wrapper avec retries ----------------
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=1, max=8),
-        retry=retry_if_exception_type(Exception),
-    )
-    def _download(self, ticker: str, **kwargs) -> pd.DataFrame:
-        """
-        Enveloppe yf.download avec:
-         - session cache
-         - threads=False
-         - auto_adjust défini par le caller (kwargs)
-        Léve RuntimeError si DataFrame vide.
-        """
-        kwargs = dict(kwargs)
-        kwargs.setdefault("progress", False)
-        kwargs.setdefault("threads", False)
-        kwargs.setdefault("session", self.session)
-
-        df = yf.download(ticker, **kwargs)
-        if df is None or df.empty:
-            raise RuntimeError(f"Empty data from Yahoo for {ticker} with {kwargs}")
-        return _tz_naive_index(df)
-
     # --------------------------- Prices ---------------------------
     def get_price_series(self, ticker: str, start: str, end: str) -> PriceSeries:
-        # On garde auto_adjust=False pour la cohérence avec le reste du projet
-        raw = self._download(
-            ticker,
-            start=start,
-            end=end,
-            auto_adjust=False,
-            interval="1d",
-        )
-        # colonne de référence = 'Close' → 'price'
-        if "Close" not in raw.columns:
-            # fallback: prend la 1re colonne numérique
-            num_cols = [c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])]
-            if not num_cols:
-                raise RuntimeError(f"No price-like column for {ticker}")
-            close = raw[num_cols[0]].rename("price")
-        else:
-            close = raw["Close"].rename("price")
-
-        data = pd.DataFrame(close).dropna()
-        if data.empty:
-            raise RuntimeError(f"No usable price data for {ticker}")
-
+        data = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
+        data = data[["Close"]].dropna()
+        data.columns = ["price"]
         return PriceSeries(ticker=ticker, data=data)
 
     # --------------------------- Pair -----------------------------
@@ -123,30 +37,44 @@ class YahooDataProvider(MarketDataProvider):
             how="inner",
             lsuffix=f"_{ticker1}",
             rsuffix=f"_{ticker2}",
-        ).dropna()
+        )
         return s1, s2, df
 
     # ------------------------- Dividends --------------------------
     def get_dividends(self, ticker: str, start: Optional[str] = None, end: Optional[str] = None) -> pd.Series:
-        t = yf.Ticker(ticker, session=self.session)
-        divs = t.dividends  # Series
+        t = yf.Ticker(ticker)
+        divs = t.dividends  # Series indexed by date
 
         if divs is None or divs.empty:
-            return pd.Series(dtype="float64")
+            return divs
 
-        if isinstance(divs.index, pd.DatetimeIndex) and divs.index.tz is not None:
-            divs.index = divs.index.tz_convert(None)
+        # Make the index timezone-naive to avoid tz-aware vs tz-naive comparison issues
+        idx = divs.index
+        if hasattr(idx, "tz") and idx.tz is not None:
+            divs.index = idx.tz_convert(None)
 
         if start is not None:
-            divs = divs[divs.index >= pd.to_datetime(start)]
+            start_ts = pd.to_datetime(start)
+            divs = divs[divs.index >= start_ts]
+
         if end is not None:
-            divs = divs[divs.index <= pd.to_datetime(end)]
+            end_ts = pd.to_datetime(end)
+            divs = divs[divs.index <= end_ts]
+
         return divs
 
     def get_next_dividend_info(self, ticker: str) -> dict:
-        t = yf.Ticker(ticker, session=self.session)
+        """
+        Return info about next dividend if available via yfinance .info:
+        - ex_date: date of next ex-dividend (or None)
+        - annual_rate: indicated annual dividend per share (or None)
+        - yield: indicated dividend yield (decimal, not %)
+        - forecast_amount: naive estimate of next dividend (annual_rate / 4)
+        """
+        t = yf.Ticker(ticker)
         info = getattr(t, "info", {}) or {}
 
+        # exDividendDate is usually a unix timestamp (seconds)
         ex_date = None
         ex_ts = info.get("exDividendDate")
         if ex_ts:
@@ -157,7 +85,11 @@ class YahooDataProvider(MarketDataProvider):
 
         annual_rate = info.get("dividendRate")
         dividend_yield = info.get("dividendYield")
-        forecast_amount = (annual_rate / 4.0) if isinstance(annual_rate, (int, float)) else None
+
+        forecast_amount = None
+        if isinstance(annual_rate, (int, float)):
+            # Very naive assumption: quarterly payments
+            forecast_amount = annual_rate / 4.0
 
         return {
             "ex_date": ex_date,
@@ -169,40 +101,54 @@ class YahooDataProvider(MarketDataProvider):
     # -------------------------- Earnings --------------------------
     def get_earnings(self, ticker: str) -> pd.DataFrame:
         """
-        Construit un tableau earnings à partir des income statements:
-          - Period, Revenue, Earnings, Type ("Yearly"/"Quarterly")
-        """
-        t = yf.Ticker(ticker, session=self.session)
-        frames: list[pd.DataFrame] = []
+        Build an 'earnings-like' table from income statements:
 
-        # yearly
+        - Yearly: Ticker.income_stmt        (rows = metrics, cols = dates)
+        - Quarterly: Ticker.quarterly_income_stmt
+
+        Keep:
+        - Period  (year or quarter string)
+        - Revenue (Total Revenue)
+        - Earnings (Net Income)
+        - Type ("Yearly" / "Quarterly")
+        """
+        t = yf.Ticker(ticker)
+        frames = []
+
+        # ----- Yearly -----
         yearly = getattr(t, "income_stmt", None)
         if isinstance(yearly, pd.DataFrame) and not yearly.empty:
-            df_y = yearly.T.copy()
-            ren = {}
-            if "Total Revenue" in df_y.columns: ren["Total Revenue"] = "Revenue"
-            if "Net Income" in df_y.columns: ren["Net Income"] = "Earnings"
-            df_y = df_y.rename(columns=ren)
-            keep = [c for c in ["Revenue", "Earnings"] if c in df_y.columns]
-            if keep:
-                df_y = df_y[keep].copy()
+            df_y = yearly.T  # rows = dates, cols = metrics
+            rename_map = {}
+            if "Total Revenue" in df_y.columns:
+                rename_map["Total Revenue"] = "Revenue"
+            if "Net Income" in df_y.columns:
+                rename_map["Net Income"] = "Earnings"
+            df_y = df_y.rename(columns=rename_map)
+
+            keep_cols = [c for c in ["Revenue", "Earnings"] if c in df_y.columns]
+            if keep_cols:
+                df_y = df_y[keep_cols].copy()
                 idx = df_y.index
                 period = idx.year.astype(str) if isinstance(idx, pd.DatetimeIndex) else idx.astype(str)
                 df_y["Period"] = period
                 df_y["Type"] = "Yearly"
                 frames.append(df_y)
 
-        # quarterly
+        # ----- Quarterly -----
         q_stmt = getattr(t, "quarterly_income_stmt", None)
         if isinstance(q_stmt, pd.DataFrame) and not q_stmt.empty:
-            df_q = q_stmt.T.copy()
-            ren = {}
-            if "Total Revenue" in df_q.columns: ren["Total Revenue"] = "Revenue"
-            if "Net Income" in df_q.columns: ren["Net Income"] = "Earnings"
-            df_q = df_q.rename(columns=ren)
-            keep = [c for c in ["Revenue", "Earnings"] if c in df_q.columns]
-            if keep:
-                df_q = df_q[keep].copy()
+            df_q = q_stmt.T
+            rename_map = {}
+            if "Total Revenue" in df_q.columns:
+                rename_map["Total Revenue"] = "Revenue"
+            if "Net Income" in df_q.columns:
+                rename_map["Net Income"] = "Earnings"
+            df_q = df_q.rename(columns=rename_map)
+
+            keep_cols = [c for c in ["Revenue", "Earnings"] if c in df_q.columns]
+            if keep_cols:
+                df_q = df_q[keep_cols].copy()
                 idx = df_q.index
                 period = idx.to_period("Q").astype(str) if isinstance(idx, pd.DatetimeIndex) else idx.astype(str)
                 df_q["Period"] = period
@@ -212,13 +158,23 @@ class YahooDataProvider(MarketDataProvider):
         if not frames:
             return pd.DataFrame(columns=["Period", "Revenue", "Earnings", "Type"])
 
-        out = pd.concat(frames, axis=0, ignore_index=True)
-        cols = [c for c in ["Period", "Revenue", "Earnings", "Type"] if c in out.columns]
-        return out[cols]
+        earnings = pd.concat(frames, axis=0, ignore_index=True)
+        cols_order = [c for c in ["Period", "Revenue", "Earnings", "Type"] if c in earnings.columns]
+        return earnings[cols_order]
 
     # -------------------- EPS surprises (base) --------------------
     def get_eps_surprises(self, ticker: str, limit: Optional[int] = 10) -> pd.DataFrame:
-        t = yf.Ticker(ticker, session=self.session)
+        """
+        Fetch EPS estimate vs actual surprises for a ticker.
+
+        Returns columns:
+        - date (datetime)
+        - period (e.g., '2024Q4')
+        - eps_estimate
+        - eps_actual
+        - surprise_pct
+        """
+        t = yf.Ticker(ticker)
 
         try:
             hist = t.get_earnings_dates(limit=limit)
@@ -232,7 +188,7 @@ class YahooDataProvider(MarketDataProvider):
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.reset_index()
 
-        # détecter colonne de date
+        # Try to detect columns
         date_col = None
         for c in ("Earnings Date", "Date", "index"):
             if c in df.columns:
@@ -246,19 +202,19 @@ class YahooDataProvider(MarketDataProvider):
         if date_col is None:
             return pd.DataFrame()
 
-        # renommer colonnes utiles
-        ren = {}
+        # Normalize columns
+        rename_map = {}
         for c in df.columns:
             lc = str(c).lower()
             if "estimate" in lc and "eps" in lc:
-                ren[c] = "EPS Estimate"
+                rename_map[c] = "EPS Estimate"
             elif ("reported" in lc and "eps" in lc) or ("actual" in lc and "eps" in lc):
-                ren[c] = "Reported EPS"
+                rename_map[c] = "Reported EPS"
             elif "surprise" in lc:
-                ren[c] = "Surprise(%)"
+                rename_map[c] = "Surprise(%)"
             elif "quarter" in lc or "period" in lc:
-                ren[c] = "Period"
-        df = df.rename(columns=ren)
+                rename_map[c] = "Period"
+        df = df.rename(columns=rename_map)
 
         out = pd.DataFrame()
         out["date"] = pd.to_datetime(df[date_col], errors="coerce")
@@ -274,6 +230,7 @@ class YahooDataProvider(MarketDataProvider):
         out = out.dropna(subset=["date"]).sort_values("date", ascending=False)
         if limit:
             out = out.head(limit)
+
         return out.reset_index(drop=True)
 
     # -------- EPS surprises + next-session opening gap ------------
@@ -283,8 +240,19 @@ class YahooDataProvider(MarketDataProvider):
         limit: int = 16,
         include_gap: bool = True,
     ) -> pd.DataFrame:
+        """
+        EPS surprises + next-session open gap (%) computed from the same
+        price source used in Strategies (via get_price_series).
+
+        Gap rule:
+          gap_next_open_pct = (Open[next_trading_day] / Close[prev_trading_day] - 1) * 100
+        where:
+          prev_trading_day = last trading day <= earnings calendar day
+          next_trading_day = first trading day  > earnings calendar day
+        """
         import numpy as np
 
+        # 1) Base EPS surprises (dates + estimates/actuals)
         base = self.get_eps_surprises(ticker, limit=limit if limit else None)
         if base is None or base.empty:
             return base
@@ -297,38 +265,44 @@ class YahooDataProvider(MarketDataProvider):
         if not include_gap:
             return df.reset_index(drop=True)
 
-        # fenêtre prix autour des dates d'earnings
+        # 2) One price download using the same pipeline as Strategies
+        #    We grab a safe window around all earnings dates.
         w_start = (earn_day.min() - pd.Timedelta(days=7)).date().isoformat()
-        w_end = (earn_day.max() + pd.Timedelta(days=10)).date().isoformat()
+        w_end   = (earn_day.max() + pd.Timedelta(days=10)).date().isoformat()
 
-        # close via pipeline standard
-        ps_close = self.get_price_series(ticker, w_start, w_end).data.copy()
+        # close series (from get_price_series = yf.download(..., auto_adjust=False) then Close→price)
+        ps_close = self.get_price_series(ticker, w_start, w_end).data.copy()  # columns: ['price'] (Close)
         if ps_close.empty:
             df["gap_next_open_pct"] = pd.NA
             return df.reset_index(drop=True)
 
-        # OHLC pour vrais opens
-        ohlc = self._download(
-            ticker,
-            start=w_start,
-            end=w_end,
-            auto_adjust=False,
-            interval="1d",
+        # also fetch raw daily OHLC once to get real Open (same date window)
+        ohlc = yf.download(
+            ticker, start=w_start, end=w_end,
+            interval="1d", auto_adjust=False, progress=False
         )
-        if ohlc.empty or not {"Open", "Close"}.issubset(ohlc.columns):
+        if ohlc.empty or not {"Open","Close"}.issubset(ohlc.columns):
             df["gap_next_open_pct"] = pd.NA
             return df.reset_index(drop=True)
 
-        px = ohlc[["Open", "Close"]].dropna().copy()
+        # normalize indices (tz-naive) & keep needed cols
+        if getattr(ohlc.index, "tz", None) is not None:
+            ohlc.index = ohlc.index.tz_convert(None)
+        if getattr(ps_close.index, "tz", None) is not None:
+            ps_close.index = ps_close.index.tz_convert(None)
+
+        px = ohlc[["Open","Close"]].dropna().copy()
         px["prev_close"] = px["Close"].shift(1)
         px = px.dropna(subset=["prev_close"])
         px["day"] = px.index.normalize()
-        px["gap_pct"] = (px["Open"] / px["prev_close"] - 1.0) * 100.0
 
+        # compute gap for each trading day (using that day's Open and previous day's Close)
+        px["gap_pct"] = (px["Open"] / px["prev_close"] - 1.0) * 100.0
         day_to_gap = px.set_index("day")["gap_pct"]
-        days = day_to_gap.index.values  # DatetimeIndex trié
+        days = day_to_gap.index.values  # sorted DatetimeIndex
 
         def gap_for_calendar_day(d):
+            # if earnings day is trading day, use that day's gap; else first day strictly after
             if d in day_to_gap.index:
                 return float(day_to_gap.loc[d])
             i = np.searchsorted(days, np.datetime64(d), side="right")
@@ -339,6 +313,8 @@ class YahooDataProvider(MarketDataProvider):
         df["gap_next_open_pct"] = earn_day.map(gap_for_calendar_day)
         return df.reset_index(drop=True)
 
+
+
     # ------------------------ Opening Gaps ------------------------
     def get_opening_gaps(
         self,
@@ -348,18 +324,28 @@ class YahooDataProvider(MarketDataProvider):
         limit: Optional[int] = 20,
         only_earnings: bool = False,
     ) -> pd.DataFrame:
-        px = self._download(
+        """
+        Compute historical market-open gaps.
+
+        Returns:
+          date, prev_close, open, close, gap_pct, session_return_pct
+        """
+        px = yf.download(
             ticker,
             start=start,
             end=end,
             interval="1d",
             auto_adjust=False,
+            progress=False,
         )
 
         if px.empty or not {"Open", "Close"}.issubset(px.columns):
             return pd.DataFrame(columns=[
                 "date", "prev_close", "open", "close", "gap_pct", "session_return_pct"
             ])
+
+        if hasattr(px.index, "tz") and px.index.tz is not None:
+            px.index = px.index.tz_convert(None)
 
         px = px[["Open", "Close"]].dropna().copy()
         px["prev_close"] = px["Close"].shift(1)
@@ -368,7 +354,7 @@ class YahooDataProvider(MarketDataProvider):
         px["gap_pct"] = (px["Open"] / px["prev_close"] - 1.0) * 100.0
         px["session_return_pct"] = (px["Close"] / px["Open"] - 1.0) * 100.0
 
-        out = px[["Open", "Close", "prev_close", "gap_pct", "session_return_pct"]].copy()
+        out = px[["prev_close", "Open", "Close", "gap_pct", "session_return_pct"]].copy()
         out = out.rename(columns={"Open": "open", "Close": "close"})
         out.index.name = "date"
         out = out.reset_index()
@@ -386,14 +372,14 @@ class YahooDataProvider(MarketDataProvider):
 
     # --------------------------- News -----------------------------
     def get_news(self, ticker: str, limit: int = 10) -> list[dict]:
-        t = yf.Ticker(ticker, session=self.session)
+        t = yf.Ticker(ticker)
         news = getattr(t, "news", []) or []
         return news[:limit]
 
     # ---------------------- Global Indices ------------------------
     def get_global_indices_snapshot(self):
         """
-        Snapshot d’indices majeurs (dernier prix & % jour).
+        Return snapshot for major indices (last price & daily % change).
         """
         index_map = {
             "S&P 500": "^GSPC",
@@ -406,16 +392,13 @@ class YahooDataProvider(MarketDataProvider):
 
         snapshot = []
         for name, ticker in index_map.items():
-            try:
-                hist = self._download(
-                    ticker,
-                    period="2d",
-                    interval="1d",
-                    auto_adjust=False,
-                )
-            except Exception:
-                continue
-
+            hist = yf.download(
+                ticker,
+                period="2d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
             if hist.empty or "Close" not in hist.columns:
                 continue
 

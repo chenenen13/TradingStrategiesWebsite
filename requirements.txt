@@ -9,3 +9,4 @@ gunicorn==21.2.0
 python-dotenv==1.0.1
 requests-cache==1.2.1
 tenacity==9.1.2
+pandas-datareader==0.10.0
