@@ -13,9 +13,9 @@ from pages.earnings import layout as earnings_layout, register_callbacks as regi
 from pages.resources import layout as resources_layout
 
 import os
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
-load_dotenv()  # charge .env
+# load_dotenv()  # charge .env
 NEWS_API_KEY = os.getenv("78968501fb8942bc828b97f2d06ededc")
 
 
