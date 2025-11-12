@@ -7,3 +7,4 @@ statsmodels==0.14.2
 yfinance==0.2.40
 gunicorn==21.2.0
 python-dotenv==1.0.1
+requests-cache==1.2.1
