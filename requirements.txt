@@ -6,3 +6,4 @@ scipy==1.11.4
 statsmodels==0.14.2
 yfinance==0.2.40
 gunicorn==21.2.0
+python-dotenv==1.0.1
