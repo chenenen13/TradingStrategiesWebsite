@@ -18,7 +18,26 @@ class MarketDataProvider:
 class YahooDataProvider(MarketDataProvider):
     # --------------------------- Prices ---------------------------
     def get_price_series(self, ticker: str, start: str, end: str) -> PriceSeries:
-        data = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
+        data = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            auto_adjust=False,
+            progress=False,
+        )
+
+        # yfinance peut renvoyer un DataFrame vide sans lever d'exception
+        if data is None or data.empty:
+            print(f"[WARNING] No data returned for {ticker} between {start} and {end}", file=sys.stderr, flush=True)
+            # on retourne une PriceSeries vide
+            empty = pd.DataFrame(columns=["price"])
+            return PriceSeries(ticker=ticker, data=empty)
+
+        if "Close" not in data.columns:
+            print(f"[WARNING] 'Close' column missing for {ticker}", file=sys.stderr, flush=True)
+            empty = pd.DataFrame(columns=["price"])
+            return PriceSeries(ticker=ticker, data=empty)
+
         data = data[["Close"]].dropna()
         data.columns = ["price"]
         return PriceSeries(ticker=ticker, data=data)
