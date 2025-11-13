@@ -2,7 +2,7 @@
 from typing import List, Optional
 import pandas as pd
 import yfinance as yf
-
+import sys
 from .models import PriceSeries
 
 
